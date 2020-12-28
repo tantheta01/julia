@@ -124,7 +124,12 @@ function ⊑(@nospecialize(a), @nospecialize(b))
     b === Union{} && return false
     if isa(a, Conditional)
         if isa(b, Conditional)
-            return issubconditional(a, b)
+            issubconditional(a, b) && return true
+            b = maybe_extract_const_bool(b)
+            if b isa Bool && maybe_extract_const_bool(a) === b
+                return true
+            end
+            return false
         elseif isa(b, Const) && isa(b.val, Bool)
             return maybe_extract_const_bool(a) === b.val
         end

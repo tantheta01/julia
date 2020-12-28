@@ -118,8 +118,6 @@ function ⊑(@nospecialize(a), @nospecialize(b))
     end
     isa(a, MaybeUndef) && (a = a.typ)
     isa(b, MaybeUndef) && (b = b.typ)
-    (a === NOT_FOUND || b === Any) && return true
-    (a === Any || b === NOT_FOUND) && return false
     a === Union{} && return true
     b === Union{} && return false
     if isa(a, Conditional)

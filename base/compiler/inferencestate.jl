@@ -10,6 +10,8 @@ mutable struct InferenceState
     slottypes::Vector{Any}
     mod::Module
     currpc::LineNum
+    pclimitations::IdSet{InferenceState} # causes of precision restrictions (LimitedAccuracy) on currpc ssavalue
+    limitations::IdSet{InferenceState} # causes of precision restrictions (LimitedAccuracy) on return
 
     # info on the state of inference and the linfo
     src::CodeInfo
@@ -105,6 +107,7 @@ mutable struct InferenceState
         frame = new(
             InferenceParams(interp), result, linfo,
             sp, slottypes, inmodule, 0,
+            IdSet{InferenceState}(), IdSet{InferenceState}(),
             src, get_world_counter(interp), valid_worlds,
             nargs, s_types, s_edges, stmt_info,
             Union{}, W, 1, n,
@@ -263,8 +266,8 @@ function add_mt_backedge!(mt::Core.MethodTable, @nospecialize(typ), caller::Infe
     nothing
 end
 
-function poison_callstack(infstate::InferenceState, topmost::InferenceState, poison_topmost::Bool)
-    poison_topmost && (topmost = topmost.parent)
+function poison_callstack(infstate::InferenceState, topmost::InferenceState)
+    push!(infstate.pclimitations, topmost)
     while !(infstate === topmost)
         if call_result_unused(infstate)
             # If we won't propagate the result any further (since it's typically unused),

@@ -234,50 +234,42 @@ function _typeinf(interp::AbstractInterpreter, frame::InferenceState)
     results = Tuple{InferenceResult, Vector{Any}, Bool}[
             ( frames[i].result,
               frames[i].stmt_edges[1],
-              frames[i].cached || frames[i].parent !== nothing )
+              frames[i].cached )
         for i in 1:length(frames) ]
     empty!(frames)
-    cached = frame.cached
-    if cached || frame.parent !== nothing
-        for (caller, _, doopt) in results
+    if may_optimize(interp)
+        for (caller, _, _) in results
             opt = caller.src
             if opt isa OptimizationState
-                run_optimizer = doopt && may_optimize(interp)
-                if run_optimizer
-                    optimize(interp, opt, OptimizationParams(interp), caller.result)
-                    finish(opt.src, interp)
-                    # finish updating the result struct
-                    validate_code_in_debug_mode(opt.linfo, opt.src, "optimized")
-                    if opt.const_api
-                        if caller.result isa Const
-                            caller.src = caller.result
-                        else
-                            @assert isconstType(caller.result)
-                            caller.src = Const(caller.result.parameters[1])
-                        end
-                    elseif opt.src.inferred
-                        caller.src = opt.src::CodeInfo # stash a copy of the code (for inlining)
+                optimize(interp, opt, OptimizationParams(interp), caller.result)
+                finish(opt.src, interp)
+                # finish updating the result struct
+                validate_code_in_debug_mode(opt.linfo, opt.src, "optimized")
+                if opt.const_api
+                    if caller.result isa Const
+                        caller.src = caller.result
                     else
-                        caller.src = nothing
+                        @assert isconstType(caller.result)
+                        caller.src = Const(caller.result.parameters[1])
                     end
+                elseif opt.src.inferred
+                    caller.src = opt.src::CodeInfo # stash a copy of the code (for inlining)
+                else
+                    caller.src = nothing
                 end
                 caller.valid_worlds = opt.inlining.et.valid_worlds[]
             end
         end
     end
-    for (caller, edges, doopt) in results
+    for (caller, edges, cached) in results
         valid_worlds = caller.valid_worlds
-        if last(valid_worlds) == get_world_counter()
-            valid_worlds = WorldRange(first(valid_worlds), typemax(UInt))
-        end
-        caller.valid_worlds = valid_worlds
-        if cached
-            cache_result!(interp, caller)
-        end
-        if doopt && last(valid_worlds) == typemax(UInt)
+        if last(valid_worlds) >= get_world_counter()
             # if we aren't cached, we don't need this edge
             # but our caller might, so let's just make it anyways
             store_backedges(caller, edges)
+        end
+        if cached
+            cache_result!(interp, caller)
         end
     end
     return true
@@ -365,6 +357,11 @@ end
 
 function cache_result!(interp::AbstractInterpreter, result::InferenceResult)
     valid_worlds = result.valid_worlds
+    if last(valid_worlds) == get_world_counter()
+        # if we've successfully recorded all of the backedges in the global reverse-cache,
+        # we can now widen our applicability in the global cache too
+        valid_worlds = WorldRange(first(valid_worlds), typemax(UInt))
+    end
     # check if the existing linfo metadata is also sufficient to describe the current inference result
     # to decide if it is worth caching this
     already_inferred = already_inferred_quick_test(interp, result.linfo)
@@ -400,19 +397,48 @@ function finish(me::InferenceState, interp::AbstractInterpreter)
         append!(s_edges, me.src.edges)
         me.src.edges = nothing
     end
-    if me.limited && me.cached && me.parent !== nothing
-        # a top parent will be cached still, but not this intermediate work
+    # inspect whether our inference had a limited result accuracy,
+    # else it may be suitable to cache
+    limited_ret = false
+    limited_src = false
+    if me.parent !== nothing
+        if me.bestguess isa LimitedAccuracy
+            limited_ret = true
+        else
+            gt = me.src.ssavaluetypes
+            for j = 1:length(gt)
+                if gt[j] isa LimitedAccuracy
+                    limited_src = true
+                    break
+                end
+            end
+        end
+    end
+    if limited_ret
+        # a parent may be cached still, but not this intermediate work:
         # we can throw everything else away now
+        me.result.src = nothing
         me.cached = false
+        me.src.inlineable = false
         unlock_mi_inference(interp, me.linfo)
+    elseif limited_src
+        # a type result will be cached still, but not this intermediate work:
+        # we can throw everything else away now
+        me.result.src = nothing
         me.src.inlineable = false
     else
-        # annotate fulltree with type information
-        type_annotate!(me)
-        me.result.src = OptimizationState(me, OptimizationParams(interp), interp)
+        # annotate fulltree with type information,
+        # either because we are the outermost code, or we might use this later
+        doopt = (me.cached || me.parent !== nothing)
+        type_annotate!(me, doopt)
+        if doopt
+            me.result.src = OptimizationState(me, OptimizationParams(interp), interp)
+        else
+            me.result.src = me.src::CodeInfo # stash a convenience copy of the code (e.g. for reflection)
+        end
     end
     me.result.valid_worlds = me.valid_worlds
-    me.result.result = me.bestguess
+    me.result.result = ignorelimited(me.bestguess)
     nothing
 end
 
@@ -497,7 +523,7 @@ end
 function visit_slot_load!(sl::Slot, vtypes::VarTable, sv::InferenceState, undefs::Array{Bool,1})
     id = slot_id(sl)
     s = vtypes[id]
-    vt = widenconditional(s.typ)
+    vt = widenconditional(ignorelimited(s.typ))
     if s.undef
         # find used-undef variables
         undefs[id] = true
@@ -542,10 +568,9 @@ function record_slot_assign!(sv::InferenceState)
 end
 
 # annotate types of all symbols in AST
-function type_annotate!(sv::InferenceState)
-    # delete dead statements only if we're building this IR to cache it
-    # (otherwise, we'll run the optimization passes later, outside of inference)
-    run_optimizer = (sv.cached || sv.parent !== nothing)
+function type_annotate!(sv::InferenceState, run_optimizer::Bool)
+    # as an optimization, we delete dead statements immediately if we're going to run the optimizer
+    # (otherwise, we'll perhaps run the optimization passes later, outside of inference)
 
     # remove all unused ssa values
     gt = sv.src.ssavaluetypes
@@ -553,14 +578,14 @@ function type_annotate!(sv::InferenceState)
         if gt[j] === NOT_FOUND
             gt[j] = Union{}
         end
-        gt[j] = widenconditional(gt[j])
+        gt[j] = widenconditional(ignorelimited(gt[j]))
     end
 
     # compute the required type for each slot
     # to hold all of the items assigned into it
     record_slot_assign!(sv)
     sv.src.slottypes = sv.slottypes
-    sv.src.rettype = sv.bestguess
+    sv.src.rettype = ignorelimited(sv.bestguess)
 
     # annotate variables load types
     # remove dead code optimization
@@ -697,7 +722,7 @@ function resolve_call_cycle!(interp::AbstractInterpreter, linfo::MethodInstance,
                 # our attempt to speculate into a constant call lead to an undesired self-cycle
                 # that cannot be converged: poison our call-stack (up to the discovered duplicate frame)
                 # with the limited flag and abort (set return type to Any) now
-                poison_callstack(parent, frame, false)
+                poison_callstack(parent, frame)
                 return true
             end
             merge_call_chain!(parent, frame, frame, limited)
@@ -706,7 +731,7 @@ function resolve_call_cycle!(interp::AbstractInterpreter, linfo::MethodInstance,
         for caller in frame.callers_in_cycle
             if is_same_frame(interp, linfo, caller)
                 if uncached
-                    poison_callstack(parent, frame, false)
+                    poison_callstack(parent, frame)
                     return true
                 end
                 merge_call_chain!(parent, frame, caller, limited)
@@ -754,7 +779,7 @@ function typeinf_edge(interp::AbstractInterpreter, method::Method, @nospecialize
             unlock_mi_inference(interp, mi)
             return Any, nothing
         end
-        if caller.cached || caller.limited # don't involve uncached functions in cycle resolution
+        if caller.cached || caller.parent !== nothing # don't involve uncached functions in cycle resolution
             frame.parent = caller
         end
         typeinf(interp, frame)

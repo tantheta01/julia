@@ -1268,3 +1268,10 @@ end
     @test_throws BoundsError copyto!(fill(0.0, 50), ntuple(x->1.0, 100))
     @test_throws ArgumentError copyto!(fill(0.0, 5), ntuple(randtype, 7))
 end
+
+@testset "splatting into hvcat" begin
+    t = (1, 2)
+    @test [t...; 3 4] == [1 2; 3 4]
+    @test [0 t...; t... 0] == [0 1 2; 1 2 0]
+    @test_throws ArgumentError [t...; 3 4 5]
+end

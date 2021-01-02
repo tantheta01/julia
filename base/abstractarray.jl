@@ -1789,6 +1789,10 @@ typed_hcat(T::Type, A::AbstractArray...) = cat_t(T, A...; dims=Val(2))
 
 # 2d horizontal and vertical concatenation
 
+tuple_cat(t) = foldl((x, y) -> (x..., y...), t; init=())
+hvcat_rows(rows::Tuple...) = hvcat(map(length, rows), tuple_cat(rows)...)
+typed_hvcat_rows(T::Type, rows::Tuple...) = typed_hvcat(T, map(length, rows), tuple_cat(rows)...)
+
 function hvcat(nbc::Integer, as...)
     # nbc = # of block columns
     n = length(as)

@@ -296,19 +296,26 @@ unitrange_last(start::T, stop::T) where {T} =
                           convert(T,start-oneunit(stop-start)))
 
 if isdefined(Main, :Base)
-    # Constant-fold-able indexing into tuples to functionally expose Base.tail and Base.front
-    function getindex(@nospecialize(t::Tuple), r::UnitRange)
-        @_inline_meta
-        r.start > r.stop && return ()
-        if r.start == 1
-            r.stop == length(t)   && return t
-            r.stop == length(t)-1 && return front(t)
-            r.stop == length(t)-2 && return front(front(t))
-        elseif r.stop == length(t)
-            r.start == 2 && return tail(t)
-            r.start == 3 && return tail(tail(t))
+    function checkbounds(@nospecialize(t::Tuple), r::AbstractUnitRange)
+        isempty(r) && return
+        if !(1 <= first(r) <= length(t) && 0 <= last(r) <= length(t))
+            throw_boundserror(t, r)
         end
-        return (eltype(t)[t[ri] for ri in r]...,)
+    end
+    # Constant-fold-able indexing into tuples to functionally expose Base.tail and Base.front
+    function getindex(@nospecialize(t::Tuple), r::AbstractUnitRange)
+        @_inline_meta
+        isempty(r) && return ()
+        if first(r) == 1
+            last(r) == length(t)   && return t
+            last(r) == length(t)-1 && return front(t)
+            last(r) == length(t)-2 && return front(front(t))
+        elseif last(r) == length(t)
+            first(r) == 2 && return tail(t)
+            first(r) == 3 && return tail(tail(t))
+        end
+        @boundscheck checkbounds(t, r)
+        return ntuple(i -> t[i + first(r) - 1], length(r))
     end
 end
 
